@@ -5,6 +5,7 @@ import { getCache, setCache } from '../db/index.js';
 import { absoluteUrl, cleanText, moneyFromText, normalizeQuery } from '../utils/text.js';
 
 const SITE_ORIGIN = 'https://www.comprasparaguai.com.br';
+const SITE_HOST_RE = /(?:www\.|mobile\.)?comprasparaguai\.com\.br/i;
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 const directClient = axios.create({
@@ -54,32 +55,55 @@ async function fetchPage(input) {
   const url = siteUrl(input);
   try {
     const response = await directClient.get(url);
-    return { content: String(response.data || ''), format: 'html', source: 'direct' };
+    return { content: String(response.data || ''), format: 'html', source: 'direct', url };
   } catch (error) {
     const status = error.response?.status;
     const blocked = status === 401 || status === 403 || status === 429;
     if (!blocked) throw friendlyRequestError(error);
 
     console.warn(`[ComprasParaguai] Acesso direto bloqueado (${status}). Tentando leitor alternativo.`);
-    try {
-      // O Reader recebe a URL completa após o prefixo e costuma funcionar quando
-      // o IP do Railway é bloqueado pelo WAF/CDN do site consultado.
-      const readerUrl = `https://r.jina.ai/${url}`;
-      const response = await readerClient.get(readerUrl);
-      return { content: String(response.data || ''), format: 'markdown', source: 'reader' };
-    } catch (readerError) {
-      const readerStatus = readerError.response?.status;
-      const finalError = new Error(
-        `O Compras Paraguai bloqueou a consulta do servidor${status ? ` (HTTP ${status})` : ''}` +
-        `${readerStatus ? ` e o acesso alternativo respondeu HTTP ${readerStatus}` : ''}.`
-      );
-      finalError.code = 'COMPRAS_PARAGUAI_BLOCKED';
-      finalError.cause = readerError;
-      throw finalError;
+
+    // Alguns destinos funcionam no Reader apenas com http://, outros com https://.
+    // Também tentamos o domínio mobile, pois ele pode ter regras de CDN diferentes.
+    const parsed = new URL(url);
+    const pathAndQuery = `${parsed.pathname}${parsed.search}`;
+    const targets = uniqueBy([
+      url,
+      `http://www.comprasparaguai.com.br${pathAndQuery}`,
+      `https://mobile.comprasparaguai.com.br${pathAndQuery}`,
+      `http://mobile.comprasparaguai.com.br${pathAndQuery}`
+    ], (value) => value);
+
+    let lastError;
+    for (const target of targets) {
+      try {
+        const readerUrl = `https://r.jina.ai/${target}`;
+        const response = await readerClient.get(readerUrl);
+        const content = String(response.data || '');
+        if (!content.trim()) continue;
+        const looksHtml = /<!doctype html|<html[\s>]|<body[\s>]/i.test(content);
+        console.info(`[ComprasParaguai] Leitor alternativo respondeu (${content.length} bytes) para ${target}.`);
+        return {
+          content,
+          format: looksHtml ? 'html' : 'markdown',
+          source: 'reader',
+          url: target
+        };
+      } catch (readerError) {
+        lastError = readerError;
+      }
     }
+
+    const readerStatus = lastError?.response?.status;
+    const finalError = new Error(
+      `O Compras Paraguai bloqueou a consulta do servidor${status ? ` (HTTP ${status})` : ''}` +
+      `${readerStatus ? ` e o acesso alternativo respondeu HTTP ${readerStatus}` : ''}.`
+    );
+    finalError.code = 'COMPRAS_PARAGUAI_BLOCKED';
+    finalError.cause = lastError;
+    throw finalError;
   }
 }
-
 function friendlyRequestError(error) {
   const status = error.response?.status;
   const message = status
@@ -93,14 +117,38 @@ function friendlyRequestError(error) {
 
 function parseMarkdownLinks(markdown) {
   const links = [];
-  const regex = /\[([^\]]{2,240})\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g;
+
+  // Links Markdown tradicionais: [texto](url)
+  const markdownRegex = /\[([^\]]{2,300})\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g;
   let match;
-  while ((match = regex.exec(markdown))) {
+  while ((match = markdownRegex.exec(markdown))) {
     links.push({ text: cleanText(match[1]), url: siteUrl(match[2]), index: match.index });
   }
-  return links;
-}
 
+  // O Jina Reader pode devolver URLs cruas ou o texto seguido da URL.
+  const rawUrlRegex = /https?:\/\/(?:www\.|mobile\.)?comprasparaguai\.com\.br\/[^\s<>()\]]+/gi;
+  while ((match = rawUrlRegex.exec(markdown))) {
+    const rawUrl = match[0].replace(/[.,;:'\"]+$/, '');
+    const before = markdown.slice(Math.max(0, match.index - 320), match.index);
+    const lines = before.split(/\r?\n/).map(cleanText).filter(Boolean);
+    const candidate = lines.reverse().find((line) =>
+      line.length >= 5 && line.length <= 260 &&
+      !/^(source:|url source:|published time:|markdown content:|image:)/i.test(line)
+    );
+    links.push({ text: cleanText(candidate || ''), url: siteUrl(rawUrl), index: match.index });
+  }
+
+  // Também aceita caminhos relativos soltos, comuns em HTML convertido para texto.
+  const relativeRegex = /(?:^|[\s"'(])\/(?!busca\/|lojas\/|categorias\/)([a-z0-9][a-z0-9\-_%]*_+\d+)\/?(?:\?[^\s<>()\]]*)?/gim;
+  while ((match = relativeRegex.exec(markdown))) {
+    const relative = `/${match[1]}/`;
+    const before = markdown.slice(Math.max(0, match.index - 260), match.index);
+    const lines = before.split(/\r?\n/).map(cleanText).filter(Boolean);
+    links.push({ text: cleanText(lines.at(-1) || ''), url: siteUrl(relative), index: match.index });
+  }
+
+  return uniqueBy(links, (item) => item.url);
+}
 function nearbyText(text, index, radius = 350) {
   return cleanText(text.slice(Math.max(0, index - radius), Math.min(text.length, index + radius)));
 }
@@ -129,23 +177,80 @@ function parseProductsFromHtml(html) {
   return products;
 }
 
-function parseProductsFromMarkdown(markdown) {
-  return parseMarkdownLinks(markdown)
-    .filter(({ url }) => /comprasparaguai\.com\.br\/.+_\d+\/?(?:\?|$)/i.test(url))
-    .filter(({ url }) => !url.includes('/lojas/'))
-    .map((link) => {
-      const block = nearbyText(markdown, link.index, 500);
-      return {
-        name: link.text,
-        usd: moneyFromText(block, 'USD'),
-        brl: moneyFromText(block, 'BRL'),
-        offers: Number.parseInt(block.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10),
-        url: link.url
-      };
-    })
-    .filter((item) => item.name.length >= 8 && item.name.length <= 240);
+function productUrlInfo(inputUrl) {
+  try {
+    const parsed = new URL(inputUrl, SITE_ORIGIN);
+    if (!SITE_HOST_RE.test(parsed.hostname)) return null;
+    if (/^\/(?:busca|lojas|categorias)\//i.test(parsed.pathname)) return null;
+    // Há páginas agrupadoras com _48863 e ofertas individuais com __5335591.
+    const match = parsed.pathname.match(/^\/([^/]*?_+\d+)\/?$/i);
+    if (!match) return null;
+    return { url: `${SITE_ORIGIN}/${match[1]}/`, slug: match[1] };
+  } catch {
+    return null;
+  }
 }
 
+function titleFromSlug(slug = '') {
+  return cleanText(
+    decodeURIComponent(slug)
+      .replace(/_+\d+$/, '')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\b\w/g, (letter) => letter.toUpperCase())
+  );
+}
+
+function bestProductName(linkText, block, slug) {
+  const invalid = /^(ver oferta|ver ofertas|saiba mais|imagem|image|produto|link)$/i;
+  const candidates = [
+    cleanText(linkText),
+    ...String(block).split(/\r?\n/).map(cleanText).reverse(),
+    titleFromSlug(slug)
+  ];
+  return candidates.find((value) =>
+    value && value.length >= 8 && value.length <= 240 &&
+    !invalid.test(value) &&
+    !/^(US\$|R\$|a partir de|\d+ ofertas?)/i.test(value)
+  ) || titleFromSlug(slug);
+}
+
+function parseProductsFromMarkdown(markdown) {
+  const products = [];
+  for (const link of parseMarkdownLinks(markdown)) {
+    const info = productUrlInfo(link.url);
+    if (!info) continue;
+    const rawBlock = markdown.slice(Math.max(0, link.index - 650), Math.min(markdown.length, link.index + 350));
+    const block = cleanText(rawBlock);
+    const name = bestProductName(link.text, rawBlock, info.slug);
+    products.push({
+      name,
+      usd: moneyFromText(block, 'USD'),
+      brl: moneyFromText(block, 'BRL'),
+      offers: Number.parseInt(block.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10),
+      url: info.url
+    });
+  }
+
+  // Último recurso: encontra slugs mesmo quando o Reader removeu a marcação dos links.
+  const slugRegex = /(?:https?:\/\/(?:www\.|mobile\.)?comprasparaguai\.com\.br)?\/([a-z0-9][a-z0-9\-_%]*?_+\d+)\/?/gi;
+  let match;
+  while ((match = slugRegex.exec(markdown))) {
+    const info = productUrlInfo(`${SITE_ORIGIN}/${match[1]}/`);
+    if (!info) continue;
+    const rawBlock = markdown.slice(Math.max(0, match.index - 650), Math.min(markdown.length, match.index + 350));
+    const block = cleanText(rawBlock);
+    products.push({
+      name: bestProductName('', rawBlock, info.slug),
+      usd: moneyFromText(block, 'USD'),
+      brl: moneyFromText(block, 'BRL'),
+      offers: Number.parseInt(block.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10),
+      url: info.url
+    });
+  }
+
+  return uniqueBy(products, (item) => item.url)
+    .filter((item) => item.name.length >= 8 && item.name.length <= 240);
+}
 export async function searchProducts(rawQuery) {
   const query = normalizeQuery(rawQuery);
   if (query.length < 2) throw new Error('Digite pelo menos 2 caracteres.');
@@ -158,6 +263,8 @@ export async function searchProducts(rawQuery) {
   const products = page.format === 'html'
     ? parseProductsFromHtml(page.content)
     : parseProductsFromMarkdown(page.content);
+
+  console.info(`[ComprasParaguai] Parser ${page.format}/${page.source}: ${products.length} produto(s) identificado(s).`);
 
   const result = uniqueBy(products, (p) => p.url)
     .sort((a, b) => Number(Boolean(b.usd)) - Number(Boolean(a.usd)))
