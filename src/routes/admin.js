@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import express from 'express';
-import QRCode from 'qrcode';
 import { config } from '../config.js';
 import { recentLogs } from '../db/index.js';
 import { getWhatsAppState, logoutWhatsApp, restartWhatsApp } from '../bot/whatsapp.js';
@@ -26,8 +25,8 @@ adminRouter.post('/logout', requireAuth, (req, res) => req.session.destroy(() =>
 adminRouter.get('/', requireAuth, (req, res) => res.send(renderAdmin()));
 adminRouter.get('/api/status', requireAuth, async (_req, res) => {
   const state = getWhatsAppState();
-  const qrDataUrl = state.qr ? await QRCode.toDataURL(state.qr, { width: 340, margin: 2 }) : null;
-  res.json({ ...state, qrDataUrl, logs: await recentLogs(30) });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ...state, logs: await recentLogs(30) });
 });
 adminRouter.post('/api/restart', requireAuth, async (_req, res) => { await restartWhatsApp(); res.json({ ok: true }); });
 adminRouter.post('/api/disconnect', requireAuth, async (_req, res) => { await logoutWhatsApp(); res.json({ ok: true }); });
