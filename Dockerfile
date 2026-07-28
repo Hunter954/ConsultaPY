@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM node:20-bookworm-slim
 
 WORKDIR /app
@@ -6,20 +5,21 @@ WORKDIR /app
 ENV NODE_ENV=production \
     NPM_CONFIG_AUDIT=false \
     NPM_CONFIG_FUND=false \
-    NPM_CONFIG_UPDATE_NOTIFIER=false
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FETCH_RETRIES=5 \
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=20000 \
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000 \
+    NPM_CONFIG_FETCH_TIMEOUT=300000
 
-# Copia primeiro apenas os arquivos de dependências para aproveitar o cache.
-COPY package.json .npmrc ./
+# Copia primeiro os arquivos de dependências para aproveitar o cache de camadas.
+COPY package*.json ./
 
-# Cache do npm reduz downloads repetidos nos próximos builds do Railway.
-RUN --mount=type=cache,target=/root/.npm \
-    npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
+# Sem --mount: essa sintaxe estava sendo rejeitada pelo builder do Railway.
+RUN npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
 
 COPY . .
 
-# O processo roda como root dentro do container para conseguir escrever no
-# Volume montado pelo Railway em /data, mesmo quando o mount substitui as
-# permissões criadas durante o build.
+# O serviço permanece como root para conseguir escrever no Volume montado em /data.
 RUN mkdir -p /data/baileys && chmod -R 0777 /data
 
 EXPOSE 3000
