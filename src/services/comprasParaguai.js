@@ -62,41 +62,109 @@ function comparableToken(token = '') {
   return token.replace(/0/g, 'o');
 }
 
+const GENERIC_QUERY_TOKENS = new Set([
+  'de', 'da', 'do', 'das', 'dos', 'com', 'sem', 'para', 'por', 'the',
+  'gb', 'tb', 'mm', 'cm', 'polegadas', 'inch', 'novo', 'nova', 'original'
+]);
+
+const CATEGORY_GROUPS = {
+  watch: ['watch', 'relogio', 'smartwatch'],
+  iphone: ['iphone'],
+  ipad: ['ipad', 'tablet'],
+  macbook: ['macbook', 'notebook', 'laptop'],
+  celular: ['celular', 'smartphone', 'telefone'],
+  fone: ['fone', 'headphone', 'earphone', 'airpods'],
+  caixa: ['caixa', 'speaker', 'portatil'],
+  camera: ['camera'],
+  console: ['console', 'playstation', 'xbox', 'nintendo']
+};
+
+function tokenMatchesName(token, nameTokens, compactName) {
+  const comparable = comparableToken(token);
+  if (!comparable) return false;
+
+  // Modelos e capacidades numéricas precisam aparecer exatamente, evitando
+  // que "11" seja confundido com "17" ou qualquer outro número.
+  if (/^\d+$/.test(token)) {
+    return nameTokens.some((candidate) => candidate === token) || compactName.includes(comparable);
+  }
+
+  if (nameTokens.some((candidate) => comparableToken(candidate) === comparable)) return true;
+  if (comparable.length >= 3 && nameTokens.some((candidate) => {
+    const normalizedCandidate = comparableToken(candidate);
+    return normalizedCandidate.includes(comparable) || comparable.includes(normalizedCandidate);
+  })) return true;
+
+  return comparable.length >= 2 && compactName.includes(comparable);
+}
+
+function queryCategoryTokens(queryTokens) {
+  const required = [];
+  for (const [category, aliases] of Object.entries(CATEGORY_GROUPS)) {
+    if (queryTokens.some((token) => aliases.includes(token))) required.push(category);
+  }
+  return required;
+}
+
+function categoryMatchesName(category, normalizedName) {
+  return CATEGORY_GROUPS[category].some((alias) =>
+    normalizedName.split(' ').includes(alias) || normalizedName.includes(alias)
+  );
+}
+
+function hasConflictingCategory(requiredCategories, normalizedName) {
+  if (requiredCategories.includes('watch') && /\b(iphone|celular|smartphone)\b/.test(normalizedName) && !/\b(watch|relogio|smartwatch)\b/.test(normalizedName)) return true;
+  if (requiredCategories.includes('iphone') && /\b(ipad|macbook|watch|relogio)\b/.test(normalizedName) && !/\biphone\b/.test(normalizedName)) return true;
+  if (requiredCategories.includes('ipad') && /\b(iphone|macbook|watch)\b/.test(normalizedName) && !/\bipad\b/.test(normalizedName)) return true;
+  if (requiredCategories.includes('macbook') && /\b(iphone|ipad|watch)\b/.test(normalizedName) && !/\bmacbook\b/.test(normalizedName)) return true;
+  return false;
+}
+
 function productRelevance(productName, query) {
   const name = normalizeSearchText(productName);
   const normalizedQuery = normalizeSearchText(query);
   if (!name || !normalizedQuery) return 0;
 
   const queryTokens = normalizedQuery.split(' ').filter(Boolean);
+  const meaningfulTokens = queryTokens.filter((token) => !GENERIC_QUERY_TOKENS.has(token));
   const nameTokens = name.split(' ').filter(Boolean);
   const compactName = comparableToken(name.replace(/\s+/g, ''));
   const compactQuery = comparableToken(normalizedQuery.replace(/\s+/g, ''));
+  const requiredCategories = queryCategoryTokens(meaningfulTokens);
 
-  let matched = 0;
-  let score = 0;
-  for (const token of queryTokens) {
-    const comparable = comparableToken(token);
-    const exact = nameTokens.some((candidate) => comparableToken(candidate) === comparable);
-    const partial = comparable.length >= 3 && nameTokens.some((candidate) => {
-      const normalizedCandidate = comparableToken(candidate);
-      return normalizedCandidate.includes(comparable) || comparable.includes(normalizedCandidate);
-    });
-    const compact = comparable.length >= 2 && compactName.includes(comparable);
-    if (exact || partial || compact) {
-      matched += 1;
-      score += exact ? 5 : partial ? 3 : 2;
-    }
+  if (hasConflictingCategory(requiredCategories, name)) return 0;
+  if (requiredCategories.some((category) => !categoryMatchesName(category, name))) return 0;
+
+  const tokenResults = meaningfulTokens.map((token) => ({
+    token,
+    matched: tokenMatchesName(token, nameTokens, compactName)
+  }));
+
+  // Números, marcas e famílias de produto são obrigatórios. Isso impede que
+  // "Apple Watch 11" retorne iPhone 17 apenas por conter a palavra Apple.
+  const strictTokens = tokenResults.filter(({ token }) =>
+    /^\d+$/.test(token) || token.length <= 4 ||
+    ['apple', 'samsung', 'xiaomi', 'motorola', 'jbl', 'sony', 'lg', 'dji', 'canon', 'nikon', 'watch', 'iphone', 'ipad', 'macbook'].includes(token)
+  );
+  if (strictTokens.some(({ matched }) => !matched)) return 0;
+
+  const matchedCount = tokenResults.filter(({ matched }) => matched).length;
+  const requiredMatches = meaningfulTokens.length <= 2
+    ? meaningfulTokens.length
+    : Math.max(2, Math.ceil(meaningfulTokens.length * 0.75));
+  if (matchedCount < requiredMatches) return 0;
+
+  let score = matchedCount * 8;
+  for (const { token, matched } of tokenResults) {
+    if (!matched) continue;
+    if (nameTokens.includes(token)) score += 5;
+    if (/^\d+$/.test(token)) score += 8;
   }
+  if (compactName.includes(compactQuery)) score += 24;
+  if (name.startsWith(normalizedQuery)) score += 10;
+  if (requiredCategories.length) score += requiredCategories.length * 12;
 
-  if (compactName.includes(compactQuery)) score += 12;
-  if (name.startsWith(normalizedQuery)) score += 6;
-
-  const firstToken = comparableToken(queryTokens[0] || '');
-  const firstMatched = firstToken && (compactName.includes(firstToken) || nameTokens.some((t) => comparableToken(t) === firstToken));
-  if (queryTokens.length >= 2 && !firstMatched) return 0;
-
-  const minimumMatches = queryTokens.length >= 3 ? 2 : 1;
-  return matched >= minimumMatches ? score + matched * 2 : 0;
+  return score;
 }
 
 function dedupeRelevantProducts(products, query) {
@@ -345,7 +413,7 @@ function parseProductsFromMarkdown(markdown) {
 export async function searchProducts(rawQuery) {
   const query = normalizeQuery(rawQuery);
   if (query.length < 2) throw new Error('Digite pelo menos 2 caracteres.');
-  const cacheKey = `products:${query}`;
+  const cacheKey = `products:v4:${query}`;
   const cached = await getCache(cacheKey);
   if (cached) return cached;
 
