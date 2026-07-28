@@ -434,50 +434,189 @@ export async function searchProducts(rawQuery) {
   return result;
 }
 
+function storeSlug(value = '') {
+  return normalizeSearchText(value)
+    .replace(/\b(?:logo|image|imagem|loja)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function storeUrlFromName(storeName = '') {
+  const slug = storeSlug(storeName);
+  return slug ? `${SITE_ORIGIN}/lojas/${slug}/` : '';
+}
+
+function isValidStoreName(value = '') {
+  const name = cleanText(value)
+    .replace(/^(?:image|imagem|logo)\s*:\s*/i, '')
+    .replace(/^logo\s+/i, '');
+  if (!name || name.length < 2 || name.length > 100) return false;
+  if (/^(?:ver oferta|comprar|detalhes|produto|código|us\$|r\$|ofertas?)$/i.test(name)) return false;
+  return !/^\d+(?:[.,]\d+)?$/.test(name);
+}
+
+function cleanStoreName(value = '') {
+  return cleanText(value)
+    .replace(/^(?:image|imagem)\s*:\s*/i, '')
+    .replace(/^logo\s+/i, '')
+    .replace(/\s+(?:logo|imagem)$/i, '')
+    .trim();
+}
+
 function parseOffersFromHtml(html) {
   const $ = cheerio.load(html);
   const offers = [];
-  $('a[href*="/lojas/"]').each((_, anchor) => {
-    const storeUrl = absoluteUrl($(anchor).attr('href'));
-    const storeName = cleanText($(anchor).attr('title') || $(anchor).text());
-    if (!storeName || storeName.length > 100) return;
-    const row = $(anchor).closest('tr, li, article, .offer, .oferta, .card, div').first();
+  const containers = $('tr, li, article, [class*="offer"], [class*="oferta"], .card, [data-store], [data-loja]');
+
+  containers.each((_, element) => {
+    const row = $(element);
     const text = cleanText(row.text());
     const usd = moneyFromText(text, 'USD');
     const brl = moneyFromText(text, 'BRL');
     if (!usd && !brl) return;
-    offers.push({ storeName, usd, brl, storeUrl });
+
+    const storeLink = row.find('a[href*="/lojas/"]').first();
+    const storeImage = row.find('img[alt],img[title]').filter((__, img) => {
+      const value = cleanText($(img).attr('alt') || $(img).attr('title') || '');
+      return isValidStoreName(value);
+    }).first();
+
+    let storeName = cleanStoreName(
+      storeLink.attr('title') || storeLink.text() ||
+      storeImage.attr('alt') || storeImage.attr('title') ||
+      row.attr('data-store') || row.attr('data-loja') || ''
+    );
+
+    // Algumas versões da página mostram a loja apenas como texto depois do preço.
+    if (!isValidStoreName(storeName)) {
+      const candidates = text.split(/\s{2,}|\||\n/).map(cleanStoreName).filter(isValidStoreName);
+      storeName = candidates.find((candidate) => !/iphone|galaxy|celular|relogio|fone|notebook/i.test(candidate)) || '';
+    }
+    if (!isValidStoreName(storeName)) return;
+
+    const rawStoreUrl = storeLink.attr('href') || '';
+    const storeUrl = rawStoreUrl ? siteUrl(rawStoreUrl) : storeUrlFromName(storeName);
+    const offerLink = row.find('a[href*="__"]').first().attr('href') || '';
+    const offerUrl = offerLink ? siteUrl(offerLink) : '';
+    const code = text.match(/C[oó]digo\s*:\s*([A-Z0-9-]+)/i)?.[1] || '';
+
+    offers.push({ storeName, usd, brl, storeUrl, offerUrl, code });
   });
+
+  // Fallback para HTML em que cada link de loja não está dentro de um container conhecido.
+  if (!offers.length) {
+    $('a[href*="/lojas/"]').each((_, anchor) => {
+      const link = $(anchor);
+      const storeName = cleanStoreName(link.attr('title') || link.text());
+      if (!isValidStoreName(storeName)) return;
+      const row = link.closest('tr, li, article, div').first();
+      const text = cleanText(row.text());
+      const usd = moneyFromText(text, 'USD');
+      const brl = moneyFromText(text, 'BRL');
+      if (!usd && !brl) return;
+      offers.push({
+        storeName,
+        usd,
+        brl,
+        storeUrl: siteUrl(link.attr('href')),
+        offerUrl: '',
+        code: text.match(/C[oó]digo\s*:\s*([A-Z0-9-]+)/i)?.[1] || ''
+      });
+    });
+  }
+
   return offers;
 }
 
 function parseOffersFromMarkdown(markdown) {
-  return parseMarkdownLinks(markdown)
-    .filter(({ url }) => url.includes('/lojas/'))
-    .map((link) => {
-      const block = nearbyText(markdown, link.index, 420);
-      return {
-        storeName: link.text,
-        usd: moneyFromText(block, 'USD'),
-        brl: moneyFromText(block, 'BRL'),
-        storeUrl: link.url
-      };
-    })
-    .filter((offer) => offer.storeName && (offer.usd || offer.brl));
+  const offers = [];
+  const lines = String(markdown).split(/\r?\n/).map((raw, index) => ({ raw, text: cleanText(raw), index }));
+
+  // Formato mais comum do Jina Reader:
+  // nome do item -> Código -> US$ -> R$ -> Image: Nome da Loja
+  for (let i = 0; i < lines.length; i += 1) {
+    const storeMatch = lines[i].text.match(/^(?:Image|Imagem)\s*:\s*(.+)$/i);
+    if (!storeMatch) continue;
+    const storeName = cleanStoreName(storeMatch[1]);
+    if (!isValidStoreName(storeName)) continue;
+
+    const from = Math.max(0, i - 14);
+    const previous = lines.slice(from, i);
+    const block = previous.map((line) => line.text).join(' ');
+    const usd = moneyFromText(block, 'USD');
+    const brl = moneyFromText(block, 'BRL');
+    if (!usd && !brl) continue;
+
+    const code = block.match(/C[oó]digo\s*:\s*([A-Z0-9-]+)/i)?.[1] || '';
+    const itemName = [...previous].reverse().find((line) =>
+      line.text.length >= 8 &&
+      !/^(?:C[oó]digo\s*:|US\$|R\$|Image\s*:|Imagem\s*:|\*+|-+|\d+ ofertas?)/i.test(line.text)
+    )?.text || '';
+
+    // Procura links reais da loja ou da oferta no pequeno bloco original.
+    const rawBlock = lines.slice(from, Math.min(lines.length, i + 3)).map((line) => line.raw).join('\n');
+    const blockLinks = parseMarkdownLinks(rawBlock);
+    const storeLink = blockLinks.find(({ url }) => /\/lojas\//i.test(url));
+    const offerLink = blockLinks.find(({ url }) => /__\d+\/?(?:\?|$)/i.test(url));
+
+    offers.push({
+      storeName,
+      usd,
+      brl,
+      storeUrl: storeLink?.url || storeUrlFromName(storeName),
+      offerUrl: offerLink?.url || '',
+      code,
+      itemName
+    });
+  }
+
+  // Outra forma possível: o nome da loja vem como link Markdown, sem "Image:".
+  for (const link of parseMarkdownLinks(markdown)) {
+    if (!/\/lojas\//i.test(link.url)) continue;
+    const storeName = cleanStoreName(link.text);
+    if (!isValidStoreName(storeName)) continue;
+    const rawBlock = markdown.slice(Math.max(0, link.index - 700), Math.min(markdown.length, link.index + 250));
+    const block = cleanText(rawBlock);
+    const usd = moneyFromText(block, 'USD');
+    const brl = moneyFromText(block, 'BRL');
+    if (!usd && !brl) continue;
+    offers.push({
+      storeName,
+      usd,
+      brl,
+      storeUrl: link.url,
+      offerUrl: parseMarkdownLinks(rawBlock).find(({ url }) => /__\d+\/?(?:\?|$)/i.test(url))?.url || '',
+      code: block.match(/C[oó]digo\s*:\s*([A-Z0-9-]+)/i)?.[1] || ''
+    });
+  }
+
+  return offers;
 }
 
 export async function getProductOffers(productUrl) {
-  const cacheKey = `offers:${productUrl}`;
+  // v3 invalida resultados vazios ou incompletos gravados pelo parser antigo.
+  const cacheKey = `offers:v3:${productUrl}`;
   const cached = await getCache(cacheKey);
-  if (cached) return cached;
+  if (Array.isArray(cached) && cached.length) return cached;
 
   const page = await fetchPage(productUrl);
   const offers = page.format === 'html'
     ? parseOffersFromHtml(page.content)
     : parseOffersFromMarkdown(page.content);
 
-  const result = uniqueBy(offers, (o) => `${o.storeUrl}:${o.usd}:${o.brl}`).slice(0, config.maxOffers);
-  await setCache(cacheKey, result, config.cacheTtlSeconds);
+  const result = uniqueBy(
+    offers.filter((offer) => isValidStoreName(offer.storeName) && (offer.usd || offer.brl)),
+    (offer) => `${normalizeSearchText(offer.storeName)}:${offer.code || ''}:${offer.usd || ''}:${offer.brl || ''}`
+  )
+    .sort((a, b) => {
+      const priceA = Number.parseFloat(String(a.usd || '').replace(/[^0-9.,]/g, '').replace(',', '.')) || Number.MAX_SAFE_INTEGER;
+      const priceB = Number.parseFloat(String(b.usd || '').replace(/[^0-9.,]/g, '').replace(',', '.')) || Number.MAX_SAFE_INTEGER;
+      return priceA - priceB;
+    })
+    .slice(0, config.maxOffers);
+
+  console.info(`[ComprasParaguai] Ofertas ${page.format}/${page.source}: ${offers.length} bruta(s), ${result.length} válida(s).`);
+  if (result.length) await setCache(cacheKey, result, config.cacheTtlSeconds);
   return result;
 }
 
