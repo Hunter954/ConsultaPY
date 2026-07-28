@@ -4,15 +4,35 @@ import { config } from '../config.js';
 import { getCache, setCache } from '../db/index.js';
 import { absoluteUrl, cleanText, moneyFromText, normalizeQuery } from '../utils/text.js';
 
-const client = axios.create({
-  baseURL: 'https://www.comprasparaguai.com.br',
+const SITE_ORIGIN = 'https://www.comprasparaguai.com.br';
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+
+const directClient = axios.create({
   timeout: config.requestTimeoutMs,
   headers: {
-    'User-Agent': 'Mozilla/5.0 (compatible; ConsultaParaguaiBot/1.0)',
-    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.7'
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'User-Agent': BROWSER_UA,
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+    Referer: `${SITE_ORIGIN}/`,
+    'Upgrade-Insecure-Requests': '1'
   },
   maxContentLength: 5_000_000,
-  maxBodyLength: 5_000_000
+  maxBodyLength: 5_000_000,
+  validateStatus: (status) => status >= 200 && status < 400
+});
+
+const readerClient = axios.create({
+  timeout: Math.max(config.requestTimeoutMs, 30_000),
+  headers: {
+    Accept: 'text/plain, text/markdown;q=0.9, */*;q=0.8',
+    'User-Agent': BROWSER_UA,
+    'X-Return-Format': 'markdown',
+    'X-Timeout': '25'
+  },
+  maxContentLength: 8_000_000,
+  maxBodyLength: 8_000_000
 });
 
 function uniqueBy(items, keyFn) {
@@ -20,8 +40,110 @@ function uniqueBy(items, keyFn) {
   return items.filter((item) => {
     const key = keyFn(item);
     if (!key || seen.has(key)) return false;
-    seen.add(key); return true;
+    seen.add(key);
+    return true;
   });
+}
+
+function siteUrl(input) {
+  if (/^https?:\/\//i.test(input)) return input;
+  return new URL(input, SITE_ORIGIN).toString();
+}
+
+async function fetchPage(input) {
+  const url = siteUrl(input);
+  try {
+    const response = await directClient.get(url);
+    return { content: String(response.data || ''), format: 'html', source: 'direct' };
+  } catch (error) {
+    const status = error.response?.status;
+    const blocked = status === 401 || status === 403 || status === 429;
+    if (!blocked) throw friendlyRequestError(error);
+
+    console.warn(`[ComprasParaguai] Acesso direto bloqueado (${status}). Tentando leitor alternativo.`);
+    try {
+      // O Reader recebe a URL completa após o prefixo e costuma funcionar quando
+      // o IP do Railway é bloqueado pelo WAF/CDN do site consultado.
+      const readerUrl = `https://r.jina.ai/${url}`;
+      const response = await readerClient.get(readerUrl);
+      return { content: String(response.data || ''), format: 'markdown', source: 'reader' };
+    } catch (readerError) {
+      const readerStatus = readerError.response?.status;
+      const finalError = new Error(
+        `O Compras Paraguai bloqueou a consulta do servidor${status ? ` (HTTP ${status})` : ''}` +
+        `${readerStatus ? ` e o acesso alternativo respondeu HTTP ${readerStatus}` : ''}.`
+      );
+      finalError.code = 'COMPRAS_PARAGUAI_BLOCKED';
+      finalError.cause = readerError;
+      throw finalError;
+    }
+  }
+}
+
+function friendlyRequestError(error) {
+  const status = error.response?.status;
+  const message = status
+    ? `Falha ao consultar o Compras Paraguai (HTTP ${status}).`
+    : `Falha de rede ao consultar o Compras Paraguai: ${error.message}`;
+  const result = new Error(message);
+  result.code = 'COMPRAS_PARAGUAI_REQUEST_FAILED';
+  result.cause = error;
+  return result;
+}
+
+function parseMarkdownLinks(markdown) {
+  const links = [];
+  const regex = /\[([^\]]{2,240})\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g;
+  let match;
+  while ((match = regex.exec(markdown))) {
+    links.push({ text: cleanText(match[1]), url: siteUrl(match[2]), index: match.index });
+  }
+  return links;
+}
+
+function nearbyText(text, index, radius = 350) {
+  return cleanText(text.slice(Math.max(0, index - radius), Math.min(text.length, index + radius)));
+}
+
+function parseProductsFromHtml(html) {
+  const $ = cheerio.load(html);
+  const products = [];
+  $('a[href]').each((_, anchor) => {
+    const href = $(anchor).attr('href') || '';
+    if (!/^https?:\/\//.test(href) && !href.startsWith('/')) return;
+    if (href.includes('/busca/') || href.includes('/lojas/') || href.includes('/categorias/')) return;
+    const full = absoluteUrl(href);
+    if (!/comprasparaguai\.com\.br\/.+_\d+\/?(?:\?|$)/i.test(full)) return;
+    const card = $(anchor).closest('article, li, .card, .product, .produto, div').first();
+    const blockText = cleanText(card.text() || $(anchor).text());
+    const name = cleanText($(anchor).attr('title') || $(anchor).find('h1,h2,h3,h4,.title,.nome').first().text() || $(anchor).text());
+    if (!name || name.length < 8 || name.length > 240) return;
+    products.push({
+      name,
+      usd: moneyFromText(blockText, 'USD'),
+      brl: moneyFromText(blockText, 'BRL'),
+      offers: Number.parseInt(blockText.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10),
+      url: full
+    });
+  });
+  return products;
+}
+
+function parseProductsFromMarkdown(markdown) {
+  return parseMarkdownLinks(markdown)
+    .filter(({ url }) => /comprasparaguai\.com\.br\/.+_\d+\/?(?:\?|$)/i.test(url))
+    .filter(({ url }) => !url.includes('/lojas/'))
+    .map((link) => {
+      const block = nearbyText(markdown, link.index, 500);
+      return {
+        name: link.text,
+        usd: moneyFromText(block, 'USD'),
+        brl: moneyFromText(block, 'BRL'),
+        offers: Number.parseInt(block.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10),
+        url: link.url
+      };
+    })
+    .filter((item) => item.name.length >= 8 && item.name.length <= 240);
 }
 
 export async function searchProducts(rawQuery) {
@@ -31,26 +153,11 @@ export async function searchProducts(rawQuery) {
   const cached = await getCache(cacheKey);
   if (cached) return cached;
 
-  const { data: html } = await client.get('/busca/', { params: { q: query } });
-  const $ = cheerio.load(html);
-  const products = [];
-
-  $('a[href]').each((_, anchor) => {
-    const href = $(anchor).attr('href') || '';
-    if (!/^https?:\/\//.test(href) && !href.startsWith('/')) return;
-    if (href.includes('/busca/') || href.includes('/lojas/') || href.includes('/categorias/')) return;
-    const full = absoluteUrl(href);
-    if (!/comprasparaguai\.com\.br\/.+_\d+\/?(?:\?|$)/i.test(full)) return;
-
-    const card = $(anchor).closest('article, li, .card, .product, .produto, div').first();
-    const blockText = cleanText(card.text() || $(anchor).text());
-    const name = cleanText($(anchor).attr('title') || $(anchor).find('h1,h2,h3,h4,.title,.nome').first().text() || $(anchor).text());
-    if (!name || name.length < 8 || name.length > 240) return;
-    const usd = moneyFromText(blockText, 'USD');
-    const brl = moneyFromText(blockText, 'BRL');
-    const offers = Number.parseInt(blockText.match(/(\d+)\s+OFERTAS?/i)?.[1] || '0', 10);
-    products.push({ name, usd, brl, offers, url: full });
-  });
+  const url = `${SITE_ORIGIN}/busca/?q=${encodeURIComponent(query)}`;
+  const page = await fetchPage(url);
+  const products = page.format === 'html'
+    ? parseProductsFromHtml(page.content)
+    : parseProductsFromMarkdown(page.content);
 
   const result = uniqueBy(products, (p) => p.url)
     .sort((a, b) => Number(Boolean(b.usd)) - Number(Boolean(a.usd)))
@@ -60,15 +167,9 @@ export async function searchProducts(rawQuery) {
   return result;
 }
 
-export async function getProductOffers(productUrl) {
-  const cacheKey = `offers:${productUrl}`;
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
-
-  const { data: html } = await client.get(productUrl);
+function parseOffersFromHtml(html) {
   const $ = cheerio.load(html);
   const offers = [];
-
   $('a[href*="/lojas/"]').each((_, anchor) => {
     const storeUrl = absoluteUrl($(anchor).attr('href'));
     const storeName = cleanText($(anchor).attr('title') || $(anchor).text());
@@ -80,10 +181,57 @@ export async function getProductOffers(productUrl) {
     if (!usd && !brl) return;
     offers.push({ storeName, usd, brl, storeUrl });
   });
+  return offers;
+}
+
+function parseOffersFromMarkdown(markdown) {
+  return parseMarkdownLinks(markdown)
+    .filter(({ url }) => url.includes('/lojas/'))
+    .map((link) => {
+      const block = nearbyText(markdown, link.index, 420);
+      return {
+        storeName: link.text,
+        usd: moneyFromText(block, 'USD'),
+        brl: moneyFromText(block, 'BRL'),
+        storeUrl: link.url
+      };
+    })
+    .filter((offer) => offer.storeName && (offer.usd || offer.brl));
+}
+
+export async function getProductOffers(productUrl) {
+  const cacheKey = `offers:${productUrl}`;
+  const cached = await getCache(cacheKey);
+  if (cached) return cached;
+
+  const page = await fetchPage(productUrl);
+  const offers = page.format === 'html'
+    ? parseOffersFromHtml(page.content)
+    : parseOffersFromMarkdown(page.content);
 
   const result = uniqueBy(offers, (o) => `${o.storeUrl}:${o.usd}:${o.brl}`).slice(0, config.maxOffers);
   await setCache(cacheKey, result, config.cacheTtlSeconds);
   return result;
+}
+
+function extractStoreDetailsFromText(text, storeUrl, title = '') {
+  const clean = cleanText(text);
+  const phones = uniqueBy(
+    (clean.match(/(?:\+?595|0)?\s*\(?\d{2,4}\)?[\s.-]*\d{3,4}[\s.-]*\d{3,4}/g) || []).map(cleanText),
+    (value) => value
+  ).slice(0, 3);
+  const address = clean.match(/([^.\n]{5,180}(?:Ciudad del Este|Pedro Juan Caballero|Salto del Guairá)[^.\n]{0,100})/i)?.[1] || '';
+  const hours = clean.match(/De Segunda[^|.\n]{0,120}(?:\|[^.\n]{0,100})?/i)?.[0] || '';
+  return {
+    name: cleanText(title),
+    address: cleanText(address),
+    phones,
+    whatsapp: text.match(/https?:\/\/(?:wa\.me|api\.whatsapp\.com)\/[^\s)\]]+/i)?.[0] || null,
+    website: null,
+    map: text.match(/https?:\/\/(?:www\.)?(?:google\.com\/maps|maps\.app\.goo\.gl)\/[^\s)\]]+/i)?.[0] || null,
+    hours: cleanText(hours),
+    url: storeUrl
+  };
 }
 
 export async function getStoreDetails(storeUrl) {
@@ -91,33 +239,39 @@ export async function getStoreDetails(storeUrl) {
   const cached = await getCache(cacheKey);
   if (cached) return cached;
 
-  const { data: html } = await client.get(storeUrl);
-  const $ = cheerio.load(html);
-  const body = cleanText($('body').text());
-  const title = cleanText($('h1').first().text() || $('title').text().replace(/\s*[-|].*$/, ''));
-  const phones = uniqueBy((body.match(/(?:\+?595|0)?\s*\(?\d{2,4}\)?[\s.-]*\d{3,4}[\s.-]*\d{3,4}/g) || []).map(cleanText), x => x).slice(0, 3);
-  const whatsappLink = $('a[href*="wa.me"],a[href*="api.whatsapp.com"]').first().attr('href') || null;
-  const website = $('a[href^="http"]').filter((_, el) => {
-    const href = $(el).attr('href') || '';
-    return !href.includes('comprasparaguai.com.br') && !href.includes('facebook.com') && !href.includes('instagram.com') && !href.includes('wa.me');
-  }).first().attr('href') || null;
-  const mapLink = $('a[href*="google.com/maps"],a[href*="maps.app.goo.gl"]').first().attr('href') || null;
-  const addressCandidates = [];
-  $('[itemprop="streetAddress"], address, .address, .endereco, [class*="address"], [class*="endereco"]').each((_, el) => {
-    const value = cleanText($(el).text()); if (value.length > 8) addressCandidates.push(value);
-  });
-  const fallbackAddress = body.match(/([^.]{5,140}(?:Ciudad del Este|Pedro Juan Caballero|Salto del Guairá)[^.]{0,80})/i)?.[1];
-  const hours = body.match(/De Segunda[^|.]{0,100}(?:\|[^.]{0,80})?/i)?.[0] || null;
-  const details = {
-    name: title,
-    address: uniqueBy(addressCandidates, x => x)[0] || cleanText(fallbackAddress || ''),
-    phones,
-    whatsapp: whatsappLink,
-    website,
-    map: mapLink,
-    hours: cleanText(hours || ''),
-    url: storeUrl
-  };
+  const page = await fetchPage(storeUrl);
+  let details;
+
+  if (page.format === 'html') {
+    const $ = cheerio.load(page.content);
+    const body = cleanText($('body').text());
+    const title = cleanText($('h1').first().text() || $('title').text().replace(/\s*[-|].*$/, ''));
+    details = extractStoreDetailsFromText(page.content, storeUrl, title);
+    const addressCandidates = [];
+    $('[itemprop="streetAddress"], address, .address, .endereco, [class*="address"], [class*="endereco"]').each((_, el) => {
+      const value = cleanText($(el).text());
+      if (value.length > 8) addressCandidates.push(value);
+    });
+    details.address = uniqueBy(addressCandidates, (value) => value)[0] || details.address;
+    details.whatsapp = $('a[href*="wa.me"],a[href*="api.whatsapp.com"]').first().attr('href') || details.whatsapp;
+    details.website = $('a[href^="http"]').filter((_, el) => {
+      const href = $(el).attr('href') || '';
+      return !href.includes('comprasparaguai.com.br') && !href.includes('facebook.com') && !href.includes('instagram.com') && !href.includes('wa.me');
+    }).first().attr('href') || null;
+    details.map = $('a[href*="google.com/maps"],a[href*="maps.app.goo.gl"]').first().attr('href') || details.map;
+  } else {
+    const title = cleanText(page.content.match(/^Title:\s*(.+)$/im)?.[1] || '');
+    details = extractStoreDetailsFromText(page.content, storeUrl, title);
+    const links = parseMarkdownLinks(page.content);
+    details.website = links.find(({ url }) =>
+      !url.includes('comprasparaguai.com.br') &&
+      !url.includes('facebook.com') &&
+      !url.includes('instagram.com') &&
+      !url.includes('wa.me') &&
+      !url.includes('google.com/maps')
+    )?.url || null;
+  }
+
   await setCache(cacheKey, details, config.cacheTtlSeconds * 6);
   return details;
 }
