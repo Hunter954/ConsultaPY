@@ -36,6 +36,97 @@ const readerClient = axios.create({
   maxBodyLength: 8_000_000
 });
 
+
+function normalizeSearchText(value = '') {
+  return cleanText(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase('pt-BR')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function sanitizeProductName(value = '') {
+  return cleanText(String(value)
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\(https?:\/\/[^)]*\)?/gi, '')
+    .replace(/[\[\]()]+$/g, '')
+  ).slice(0, 180);
+}
+
+function comparableToken(token = '') {
+  // O site às vezes escreve Go 3 como G03. Esta forma trata 0 e O como equivalentes.
+  return token.replace(/0/g, 'o');
+}
+
+function productRelevance(productName, query) {
+  const name = normalizeSearchText(productName);
+  const normalizedQuery = normalizeSearchText(query);
+  if (!name || !normalizedQuery) return 0;
+
+  const queryTokens = normalizedQuery.split(' ').filter(Boolean);
+  const nameTokens = name.split(' ').filter(Boolean);
+  const compactName = comparableToken(name.replace(/\s+/g, ''));
+  const compactQuery = comparableToken(normalizedQuery.replace(/\s+/g, ''));
+
+  let matched = 0;
+  let score = 0;
+  for (const token of queryTokens) {
+    const comparable = comparableToken(token);
+    const exact = nameTokens.some((candidate) => comparableToken(candidate) === comparable);
+    const partial = comparable.length >= 3 && nameTokens.some((candidate) => {
+      const normalizedCandidate = comparableToken(candidate);
+      return normalizedCandidate.includes(comparable) || comparable.includes(normalizedCandidate);
+    });
+    const compact = comparable.length >= 2 && compactName.includes(comparable);
+    if (exact || partial || compact) {
+      matched += 1;
+      score += exact ? 5 : partial ? 3 : 2;
+    }
+  }
+
+  if (compactName.includes(compactQuery)) score += 12;
+  if (name.startsWith(normalizedQuery)) score += 6;
+
+  const firstToken = comparableToken(queryTokens[0] || '');
+  const firstMatched = firstToken && (compactName.includes(firstToken) || nameTokens.some((t) => comparableToken(t) === firstToken));
+  if (queryTokens.length >= 2 && !firstMatched) return 0;
+
+  const minimumMatches = queryTokens.length >= 3 ? 2 : 1;
+  return matched >= minimumMatches ? score + matched * 2 : 0;
+}
+
+function dedupeRelevantProducts(products, query) {
+  const ranked = products
+    .map((product) => ({
+      ...product,
+      name: sanitizeProductName(product.name),
+      relevance: productRelevance(product.name, query)
+    }))
+    .filter((product) => product.name.length >= 4 && product.relevance > 0)
+    .sort((a, b) => b.relevance - a.relevance || Number(Boolean(b.usd)) - Number(Boolean(a.usd)));
+
+  const seenNames = new Set();
+  const seenUrls = new Set();
+  const result = [];
+  for (const product of ranked) {
+    const nameKey = normalizeSearchText(product.name)
+      .replace(/\b(portatil|portable|rpl|global|versao|version)\b/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const urlKey = product.url.replace(/__\d+\/?$/, '').replace(/\?.*$/, '');
+    if (seenUrls.has(urlKey) || (nameKey && seenNames.has(nameKey))) continue;
+    seenUrls.add(urlKey);
+    if (nameKey) seenNames.add(nameKey);
+    const { relevance, ...cleanProduct } = product;
+    result.push(cleanProduct);
+  }
+  return result;
+}
+
 function uniqueBy(items, keyFn) {
   const seen = new Set();
   return items.filter((item) => {
@@ -266,9 +357,10 @@ export async function searchProducts(rawQuery) {
 
   console.info(`[ComprasParaguai] Parser ${page.format}/${page.source}: ${products.length} produto(s) identificado(s).`);
 
-  const result = uniqueBy(products, (p) => p.url)
-    .sort((a, b) => Number(Boolean(b.usd)) - Number(Boolean(a.usd)))
+  const result = dedupeRelevantProducts(uniqueBy(products, (p) => p.url), query)
     .slice(0, config.maxProducts);
+
+  console.info(`[ComprasParaguai] Busca "${query}": ${products.length} bruto(s), ${result.length} relevante(s).`);
 
   await setCache(cacheKey, result, config.cacheTtlSeconds);
   return result;
