@@ -46,7 +46,7 @@ export async function saveSession(jid, step, payload = {}) {
     INSERT INTO conversation_sessions(jid, step, payload, updated_at)
     VALUES($1,$2,$3,NOW())
     ON CONFLICT(jid) DO UPDATE SET step=EXCLUDED.step, payload=EXCLUDED.payload, updated_at=NOW()
-  `, [jid, step, payload]);
+  `, [jid, step, JSON.stringify(payload ?? {})]);
 }
 
 export async function clearSession(jid) {
@@ -63,11 +63,11 @@ export async function setCache(key, payload, ttlSeconds) {
     INSERT INTO search_cache(cache_key,payload,expires_at)
     VALUES($1,$2,NOW()+($3 * INTERVAL '1 second'))
     ON CONFLICT(cache_key) DO UPDATE SET payload=EXCLUDED.payload, expires_at=EXCLUDED.expires_at
-  `, [key, payload, ttlSeconds]);
+  `, [key, JSON.stringify(payload ?? null), ttlSeconds]);
 }
 
 export async function logEvent(level, event, details = {}) {
-  try { await pool.query('INSERT INTO bot_logs(level,event,details) VALUES($1,$2,$3)', [level, event, details]); }
+  try { await pool.query('INSERT INTO bot_logs(level,event,details) VALUES($1,$2,$3)', [level, event, JSON.stringify(details ?? {})]); }
   catch (error) { console.error('Falha ao gravar log:', error.message); }
 }
 
